@@ -1,0 +1,200 @@
+		if (!mutationResult.ok) {
+			const isTornTail = index === physicalLines.length - 1 && mutationResult.error.kind === "syntax";
+			if (isTornTail) {
+				// 丢弃未确认的部分写入：原子发布有效前缀
+				const validPrefix = `${physicalLines.slice(0, index).join("\n")}\n`;
+				await publishFileAtomically(fs, path, async (tempPath) => {
+					fileResult(await fs.writeFile(tempPath, validPrefix), ...);
+				});
+				return storage;
+			}
+			throw invalidFile(path, index + 1, mutationResult.error);  // 中间行损坏 = 报错
+		}
+		storage.applyMutation(mutationResult.value);
+	}
+	if (!content.endsWith("\n")) {
+		// 修复未换行结尾
+		fileResult(await fs.appendFile(path, "\n"), ...);
+	}
+	return storage;
+}
+```
+
+**教学要点**：
+1. **只有最后一行且是语法错误才判 torn-tail**——追加写崩溃只可能损坏最后一行；中间行损坏说明文件被外部改坏，直接报错不静默修复。
+2. 修复用 `publishFileAtomically`（L33-L46）：写完整临时文件 → `rename` 原子替换。临时文件策略的注释（L26-L31）说明："a process crash while populating can leave only the ignored `.tmp` file behind"——崩溃只留垃圾 tmp，不损坏原文件。
+
+### 6.5 codec：一行一 mutation 的编解码
+
+`packages/agent/src/harness/session/jsonl/codec.ts`（课程快照 L229-L239）：
+
+```typescript
+export function encodeMutation(mutation: SessionMutation): string {
+	switch (mutation.kind) {
+		case "entry":
+			return `${JSON.stringify({ kind: "entry", lane: mutation.lane, ...mutation.entry })}\n`;
+		case "record":
+			return `${JSON.stringify({ kind: "record", ...mutation.record })}\n`;
+		case "lane":
+			return `${JSON.stringify(mutation)}\n`;
+		case "fact":
+			return `${JSON.stringify(mutation)}\n`;
+	}
+}
+```
+
+文件格式：第一行 header（`{kind:"header", version:4, id, createdAt, cwd, ...}`，L70-L100），之后每行一个 mutation JSON。decode 侧（`parseMutation` L220-L227）用 Result 类型返回 `ok/err` 而非 throw——语法错误与 schema 错误分类（`error.kind === "syntax" | "schema"`），供 torn-tail 判定。
+
+### 6.6 崩溃恢复的边界（重要！）
+
+当前 JSONL 后端**不持久化操作执行进度**。`ToolStartedRecord` 有 `replay` 字段，`operation_started/finished` record 也存在，但生产路径（Agent 类）**并不写这些 record**——它们是 durable harness（第 12 课）的词汇。因此当前版本崩溃恢复语义是：
+
+- 消息级：完整恢复（transcript 全在）；
+- 操作级：不知道"删文件删到一半"之类的外部副作用状态——重启后无法判断某工具是否执行过。
+
+这正是 harness.md 规格要补的缺口（见第 12 课）。
+
+---
+
+## 第 7 课 Compaction：估算、切点、摘要生成
+
+**文件**：`packages/agent/src/harness/compaction/compaction.ts`（848 行）
+
+### 7.1 token 估算：优先用量、降级启发式
+
+```typescript
+// compaction.ts L247-L250
+export function shouldCompact(contextTokens: number, contextWindow: number, settings: CompactionSettings): boolean {
+	if (!settings.enabled) return false;
+	return contextTokens > contextWindow - settings.reserveTokens;
+}
+```
+
+默认阈值（L158-L162）：`reserveTokens: 16384`（给摘要 prompt+输出留量）、`keepRecentTokens: 20000`（保留近期上下文）。
+
+估算策略（L216-L244）：
+
+```typescript
+export function estimateContextTokens(messages: AgentMessage[]): ContextUsageEstimate {
+	const usageInfo = getLastAssistantUsageInfo(messages);   // 找最近一条有效 assistant usage
+	if (!usageInfo) {
+		/* 无用量：全量字符启发式估算 */
+	}
+	const usageTokens = calculateContextTokens(usageInfo.usage);   // provider 报告的真值
+	let trailingTokens = 0;
+	for (let i = usageInfo.index + 1; i < messages.length; i++) {
+		trailingTokens += estimateTokens(messages[i]);             // 之后的增量启发式估算
+	}
+	return { tokens: usageTokens + trailingTokens, ... };
+}
+```
+
+单消息启发式（L271-L311）：`Math.ceil(chars / 4)`（4 字符≈1 token），图片固定 4800 字符（L252）。
+
+**教学要点**：**真值锚点 + 增量估算**——最近一次 provider 报告的 usage 是精确的，其后新消息用启发式。比全量启发式准，比全量 tokenizer 快。
+
+### 7.2 切点选择：只在合法边界切
+
+`findValidCutPoints`（L312-L344）：**user/bashExecution/branchSummary/compactionSummary 消息是合法切点；toolResult 永不是**（切在 toolResult 会把它与对应的 assistant toolCall 分离，破坏上下文结构）。
+
+`findCutPoint`（L374-L422）：
+
+```typescript
+export function findCutPoint(entries, startIndex, endIndex, keepRecentTokens): CutPointResult {
+	const cutPoints = findValidCutPoints(entries, startIndex, endIndex);
+	// 从尾部累加 token，直到达到 keepRecentTokens
+	let accumulatedTokens = 0;
+	for (let i = endIndex - 1; i >= startIndex; i--) {
+		/* accumulate messageTokens */
+		if (accumulatedTokens >= keepRecentTokens) {
+			// 找到第一个 >= i 的合法切点
+			for (let c = 0; c < cutPoints.length; c++) {
+				if (cutPoints[c] >= i) { cutIndex = cutPoints[c]; break; }
+			}
+			break;
+		}
+	}
+	// 回退穿过非消息条目到消息/compaction 边界
+	// ...
+	const isUserMessage = cutEntry.type === "message" && cutEntry.message.role === "user";
+	const turnStartIndex = isUserMessage ? -1 : findTurnStartIndex(entries, cutIndex, startIndex);
+	return {
+		firstKeptEntryIndex: cutIndex,
+		turnStartIndex,
+		isSplitTurn: !isUserMessage && turnStartIndex !== -1,   // 切点落在一个 turn 中间
+	};
+}
+```
+
+**isSplitTurn**：如果保留下界切在一个 turn 的中间（比如 toolResult 后的 assistant 消息），该 turn 的前缀（user 提问 + 早期工具调用）会被摘要，后缀保留——需要**双段摘要**（见 7.3）。
+
+### 7.3 prepareCompaction 与 compact：两段式执行
+
+`prepareCompaction`（L616-L687）纯函数准备（不调 LLM）：
+
+```typescript
+export function prepareCompaction(pathEntries: Entry[], settings): Result<CompactionPreparation | undefined, CompactionError> {
+	// ① 上次 compaction 的 retainedTail 展开为"虚拟条目"参与本轮切分
+	if (prevCompactionIndex >= 0) {
+		const prevCompaction = pathEntries[prevCompactionIndex] as CompactionEntry;
+		previousSummary = prevCompaction.summary;
+		const virtualRetainedEntries: Entry[] = prevCompaction.retainedTail.map((message, index) => ({
+			type: "message",
+			id: `${prevCompaction.id}:retained:${index}`,   // 合成 id，不与真实条目冲突
+			parentId: index === 0 ? prevCompaction.id : `${prevCompaction.id}:retained:${index - 1}`,
+			/* ... */
+		}));
+		compactableEntries = [...virtualRetainedEntries, ...pathEntries.slice(prevCompactionIndex + 1)];
+	}
+	// ② 找切点，切成三段
+	const cutPoint = findCutPoint(compactableEntries, 0, boundaryEnd, settings.keepRecentTokens);
+	// → messagesToSummarize（将被摘要的历史）
+	// → turnPrefixMessages（split turn 的前缀，单独摘要）
+	// → retainedTail（保留的近期消息，将存进 CompactionEntry）
+	// ③ 提取文件操作清单（read/edited 集合，含上次的累计）
+	const fileOps = extractFileOperations(messagesToSummarize, pathEntries, prevCompactionIndex);
+	return ok({ messagesToSummarize, turnPrefixMessages, retainedTail, isSplitTurn, tokensBefore, previousSummary, fileOps, settings });
+}
+```
+
+**教学要点**：
+1. **retainedTail 的虚拟展开**——上一轮 compaction 保留的尾部消息在本轮参与切点计算，否则它们永远"卡"在切点右侧之外。
+2. **fileOps 跨轮累计**（L44-L67）：read/edited 文件集合从上次 compaction 的 details 继承再累加——模型"看过/改过哪些文件"的记忆跨压缩持续。
+
+`compact`（L707-L794）调 LLM 生成摘要：
+
+```typescript
+export async function compact(preparation, models, model, customInstructions?, signal?, ...): Promise<Result<CompactResult, CompactionError>> {
+	if (isSplitTurn && turnPrefixMessages.length > 0) {
+		// 双段：先摘要历史（可与 previousSummary 增量合并），再单独摘要 turn 前缀
+		const historyResult = await generateSummaryWithUsage(messagesToSummarize, ..., previousSummary, ...);
+		const turnPrefixResult = await generateTurnPrefixSummary(turnPrefixMessages, ...);
+		summary = `${historyText}\n\n---\n\n**Turn Context (split turn):**\n\n${turnPrefixResult.value.text}`;
+		summaryUsage = combineUsage(historyUsage, turnPrefixResult.value.usage);
+	} else {
+		// 单段：正常摘要（有 previousSummary 则走"增量更新"prompt）
+		const summaryResult = await generateSummaryWithUsage(messagesToSummarize, ..., previousSummary, ...);
+	}
+	// 摘要尾部追加文件操作清单
+	const { readFiles, modifiedFiles } = computeFileLists(fileOps);
+	summary += formatFileOperations(readFiles, modifiedFiles);
+	return ok({ summary, tokensBefore, usage: summaryUsage, retainedTail, details: { readFiles, modifiedFiles } });
+}
+```
+
+### 7.4 摘要 prompt 工程
+
+两套结构化 prompt（L424-L498）：
+
+- **SUMMARIZATION_PROMPT**（首次）：固定格式 `## Goal / ## Constraints & Preferences / ## Progress (Done|In Progress|Blocked) / ## Key Decisions / ## Next Steps / ## Critical Context`，强调"Preserve exact file paths, function names, and error messages"。
+- **UPDATE_SUMMARIZATION_PROMPT**（增量）：基于 `<previous-summary>` 更新——规则是 PRESERVE 全部旧信息、ADD 新信息、UPDATE 进度、可移除不再相关项。
+
+System prompt（L424-L426）强调角色隔离："Do NOT continue the conversation. Do NOT respond to any questions... ONLY output the structured summary."——摘要模型不得代答原对话。
+
+**请求隔离**（L102-L122）：
+
+```typescript
+export async function completeSimpleWithRetries(models, model, context, options, ...): Promise<AssistantMessage> {
+	// 摘要是独立请求：隔离路由、禁用不可复用的缓存写入
+	const requestOptions: SimpleStreamOptions = {
+		...options,
