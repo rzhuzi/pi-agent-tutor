@@ -1,0 +1,200 @@
+
+新 schema（L17-L37）：`{ path, edits: [{ oldText, newText }, ...] }`——一次调用多处编辑，description 明确要求"non-overlapping、同块修改合并为一个 edit"。
+
+**prepareArguments 兼容垫片**（L48-L64）——第 4 课 promised 的实战用例：
+
+```typescript
+function prepareEditArguments(input: unknown): EditToolInput {
+	if (!input || typeof input !== "object") return input as EditToolInput;
+	const args = input as Record<string, unknown>;
+	if (typeof args.edits === "string") {
+		try {
+			const parsed: unknown = JSON.parse(args.edits);
+			if (Array.isArray(parsed)) args.edits = parsed;   // 修复模型把数组编码成字符串
+		} catch {}
+	}
+	const legacy = args as LegacyEditToolInput;
+	if (typeof legacy.oldText !== "string" || typeof legacy.newText !== "string") return args as EditToolInput;
+	// 旧版顶层 oldText/newText 迁移到 edits 数组
+	const edits = Array.isArray(legacy.edits) ? [...legacy.edits] : [];
+	edits.push({ oldText: legacy.oldText, newText: legacy.newText });
+	const { oldText: _oldText, newText: _newText, ...rest } = legacy;
+	return { ...rest, edits } as EditToolInput;
+}
+```
+
+处理两种真实模型行为：① 把 edits 数组 JSON 编码成字符串；② 旧格式顶层 oldText/newText。**在校验前静默修复**，减少无效失败。
+
+**执行主体**（L89-L125）：
+
+```typescript
+return withFileMutationQueue(env, absolutePath, async () => {
+	// ① 读文件
+	const readResult = await env.readTextFile(absolutePath, signal);
+	// ② strip BOM + 归一化换行为 LF
+	const { bom, text: content } = stripBom(readResult.value);
+	const originalEnding = detectLineEnding(content);
+	const normalizedContent = normalizeToLF(content);
+	// ③ 应用全部 edits（基于原文匹配，非增量）
+	const { baseContent, newContent } = applyEditsToNormalizedContent(normalizedContent, edits, path);
+	// ④ 还原换行风格 + BOM 写回
+	const finalContent = bom + restoreLineEndings(newContent, originalEnding);
+	const writeResult = await env.writeFile(absolutePath, finalContent, signal);
+	// ⑤ 生成 diff 与 unified patch 作为 details
+	const diffResult = generateDiffString(baseContent, newContent);
+	return {
+		content: [{ type: "text", text: `Successfully replaced ${edits.length} block(s) in ${path}.` }],
+		details: { diff: diffResult.diff, patch: generateUnifiedPatch(...), firstChangedLine: ... },
+	};
+});
+```
+
+**教学要点**：
+1. **换行归一化三步曲**（strip BOM → LF 归一 → 编辑 → 还原）：编辑匹配在 LF 空间做，写回时还原 CRLF/BOM——跨平台文件不被破坏。
+2. `withFileMutationQueue`：**同一文件的变更操作串行化**（write 工具同样使用）——并行工具批中若同时有 write+edit 同一文件，靠这个队列避免交错写坏。
+3. 模型可见 content 只有一句成功摘要；diff/patch 进 details 给 UI——content/details 分离的又一次实践。
+
+---
+
+## 第 6 课 Session 持久化：Mutation / JSONL / torn-tail
+
+**目录**：`packages/agent/src/harness/session`
+
+### 6.1 数据模型：Entry 树 + LaneRecord + Fact
+
+`packages/agent/src/harness/session/types.ts`（课程快照 L14-L74）：
+
+```typescript
+export interface EntryBase {
+	type: string;
+	id: string;
+	seq: number;          // 全局递增序列（存储侧分配）
+	parentId: string | null;  // 父节点 → 构成会话树
+	timestamp: number;
+}
+
+export type Entry =
+	| MessageEntry            // 对话消息
+	| ModelChangeEntry        // 模型切换
+	| ThinkingLevelEntry      // 思考等级切换
+	| ActiveToolsEntry        // 工具集切换
+	| CompactionEntry         // 压缩点（summary + retainedTail）
+	| BranchSummaryEntry      // 分支摘要
+	| CustomEntry;            // 应用自定义
+```
+
+**entries 构成一棵树**：`parentId` 指向前一个条目，"分支"即从某节点另开子链。lane（默认 "main"）是指向树中某 leaf 的**指针**——移动 lane 指针 = 切换分支，旧分支数据不删。
+
+LaneRecord（L87-L212）是操作流水：`operation_started` / `abort_requested` / `operation_finished` / `step_attempt` / `tool_started` / `queue_enqueued` / `queue_cancelled` / `write_deferred` / `usage`。注意 `ToolStartedRecord`（L150-L160）带有 `replay: "never" | "safe"` 字段——这正是 harness.md 规格中 effect sandwich 的 replay policy 在存储层的前置定义。
+
+### 6.2 SessionMutation：四类原子的写操作
+
+`packages/agent/src/harness/session/state.ts`（课程快照 L17-L22）：
+
+```typescript
+export type SessionMutation =
+	| { kind: "entry"; lane?: string; entry: Entry }   // 追加树条目
+	| { kind: "record"; record: LaneRecord }           // 追加操作流水
+	| { kind: "lane"; seq: number; lane: string; leafId: string | null }  // 移动 lane 指针
+	| { kind: "fact"; seq: number; fact: "name"; name: string | undefined }        // 全局名字
+	| { kind: "fact"; seq: number; fact: "label"; targetId: string; label: string | undefined };  // 节点标签
+```
+
+**教学要点**：持久化的最小单位是 mutation（不是 entry）——日志文件的每一行就是一个 mutation 的 JSON 编码。这使得"树写 + 指针移动 + 元数据"共享同一套追加/重放机制。
+
+### 6.3 SessionState.applyMutation：重放即重建
+
+`packages/agent/src/harness/session/state.ts`（课程快照 L97-L180）。核心校验+应用：
+
+```typescript
+applyMutation(mutation: SessionMutation, invalid: InvalidMutation = invalidMutation): void {
+	const seq = /* entry.seq | record.seq | mutation.seq */;
+	if (seq !== this.sequence + 1) invalid(`has non-consecutive seq ${seq}`);   // ① 严格连续
+
+	switch (mutation.kind) {
+		case "entry": {
+			if (this.usedIds.has(mutation.entry.id)) invalid(`contains duplicate id ...`);   // ② id 唯一
+			if (mutation.lane !== undefined) {
+				const leafId = this.lanes.get(mutation.lane);
+				if (leafId === undefined) invalid(`references missing lane ...`);            // ③ lane 存在
+				if (mutation.entry.parentId !== leafId) invalid("does not chain to the lane leaf");  // ④ 链到 leaf
+			}
+			if (mutation.entry.parentId !== null && !this.entriesById.has(mutation.entry.parentId)) {
+				invalid(`references missing parent ...`);                                    // ⑤ 父存在
+			}
+			this.sequence = seq;
+			this.usedIds.add(mutation.entry.id);
+			this.entries.push(mutation.entry);
+			this.entriesById.set(mutation.entry.id, mutation.entry);
+			if (mutation.lane !== undefined) this.lanes.set(mutation.lane, mutation.entry.id);  // ⑥ leaf 前移
+			this.log.push({ kind: "entry", seq, entry: mutation.entry });
+			if (mutation.entry.type === "message") this.stats.messageCount += 1;
+			break;
+		}
+		// record / lane / fact 分支同理……
+	}
+}
+```
+
+**教学要点**：
+1. **seq 严格连续**（`seq !== this.sequence + 1` 即 invalid）——日志的任何缺口都被视为损坏。这是"原子事务"在 JSONL 上的体现：一个事务的多条 mutation 必须连续写入，中间崩溃 → seq 断裂 → 加载时报损（或整批被 torn-tail 截掉）。
+2. **entry 必须链到 lane 当前 leaf**（校验 ④）+ 应用后 leaf 前移（⑥）——保证 lane 永远指向"最新追加的条目"，写入即构建主链。
+3. **usage record 顺带累计 stats**（L143-L148）——`getStats()` 免遍历。
+
+### 6.4 JsonlSessionStorage：单写队列 + torn-tail 恢复
+
+`packages/agent/src/harness/session/jsonl/storage.ts`（277 行）
+
+**单写队列**（L258-L265）：
+
+```typescript
+private enqueue<T>(operation: () => Promise<T>): Promise<T> {
+	const result = this.tail.then(operation);   // 排在上一个写后面
+	this.tail = result.then(() => undefined, () => undefined);  // tail 不承接错误
+	return result;
+}
+
+private async appendMutation(mutation: SessionMutation): Promise<void> {
+	fileResult(
+		await this.fs.appendFile(this.metadata.path, encodeMutation(mutation)),
+		`Failed to append session ${this.metadata.path}`,
+	);
+}
+```
+
+所有写操作（appendEntry/appendRecord/createLane/setName…）都经 `enqueue` 串行化——**并发的 appendEntry 在 promise 链上排队**，文件中永不交错。`drain()`（L122-L124）等待队列清空。
+
+**写入流程**（appendEntry，L154-L169）：
+
+```typescript
+appendEntry<TEntry extends Entry>(newEntry: lane: string): Promise<TEntry> {
+	return this.enqueue(async () => {
+		const parentId = this.state.requireLane(lane);        // ① 取 lane leaf 为 parent
+		this.state.validateUnusedId(newEntry.id);             // ② id 查重
+		const entry = {
+			...structuredClone(newEntry),                     // ③ 深拷贝入参（防外部引用）
+			parentId,
+			seq: this.state.nextSequence,                     // ④ 存储侧分配 seq
+			timestamp: Date.now(),
+		} as unknown as TEntry;
+		const mutation: SessionMutation = { kind: "entry", lane, entry };
+		await this.appendMutation(mutation);                  // ⑤ 先落盘
+		this.applyMutation(mutation);                         // ⑥ 再改内存状态
+		return structuredClone(entry);                        // ⑦ 返回拷贝
+	});
+}
+```
+
+**教学要点**：⑤⑥ 的顺序是 **write-ahead**——先追加文件再更新内存。若 ⑤ 成功 ⑥ 前崩溃，重启重放时会重新 apply 该 mutation（幂等，因为重放从零构建 state）；若 ⑤ 失败则抛错、内存不变。**先持久化后提交内存**是事件溯源的标准姿势。
+
+**torn-tail 恢复**（load 静态方法，L69-L108）：
+
+```typescript
+static async load(fs, path): Promise<JsonlSessionStorage> {
+	const content = fileResult(await fs.readTextFile(path), ...);
+	const physicalLines = content.split("\n");
+	if (physicalLines.at(-1) === "") physicalLines.pop();     // 去掉末尾空行
+	// ...解析 header（第一行）...
+	for (let index = 1; index < physicalLines.length; index++) {
+		const line = physicalLines[index]!;
+		const mutationResult = parseMutation(line);
