@@ -1,0 +1,200 @@
+```typescript
+const hasSequentialToolCall = toolCalls.some(
+	(tc) => currentContext.tools?.find((t) => t.name === tc.name)?.executionMode === "sequential",
+);
+if (config.toolExecution === "sequential" || hasSequentialToolCall) {
+	return executeToolCallsSequential(...);
+}
+return executeToolCallsParallel(...);
+```
+
+**一个工具声明 sequential，整批降级为串行**。
+
+并行版（L489-L554）的结构值得精读：
+
+```typescript
+async function executeToolCallsParallel(...): Promise<ExecutedToolCallBatch> {
+	const finalizedCalls: FinalizedToolCallEntry[] = [];
+
+	// 阶段一：顺序 preflight（prepare）所有调用
+	for (const toolCall of toolCalls) {
+		await emit({ type: "tool_execution_start", ... });
+		const preparation = await prepareToolCall(...);
+		if (preparation.kind === "immediate") {
+			// 立即结果的直接收尾
+			const finalized = { toolCall, result: preparation.result, isError: preparation.isError };
+			await emitToolExecutionEnd(finalized, emit);
+			finalizedCalls.push(finalized);
+			continue;
+		}
+		// 延迟执行的闭包：execute → finalize → emit end
+		finalizedCalls.push(async () => {
+			const executed = await executePreparedToolCall(preparation, signal, emit);
+			const finalized = await finalizeExecutedToolCall(...);
+			await emitToolExecutionEnd(finalized, emit);
+			return finalized;
+		});
+	}
+
+	// 阶段二：并发执行全部闭包
+	const orderedFinalizedCalls = await Promise.all(
+		finalizedCalls.map((entry) => (typeof entry === "function" ? entry() : Promise.resolve(entry))),
+	);
+
+	// 阶段三：按 assistant 源序生成 toolResult 消息
+	const messages: ToolResultMessage[] = [];
+	for (const finalized of orderedFinalizedCalls) {
+		const toolResultMessage = createToolResultMessage(finalized);
+		await emitToolResultMessage(toolResultMessage, emit);
+		messages.push(toolResultMessage);
+	}
+	return { messages, terminate: shouldTerminateToolBatch(orderedFinalizedCalls) };
+}
+```
+
+`FinalizedToolCallEntry = FinalizedToolCallOutcome | (() => Promise<FinalizedToolCallOutcome>)`（L580）——**联合类型存"已完成的值"或"待执行的闭包"**，`Promise.all` 时统一展开。
+
+**教学要点（关键设计）**：
+- `tool_execution_end` 按**完成顺序**发出（闭包内即时 emit）——UI 实时显示先完成的工具；
+- toolResult **消息** 按 assistant 源序发出（阶段三统一生成）——因为多数 provider 要求 toolResult 顺序与 toolCall 顺序一致。
+- **事件顺序与消息顺序解耦**：这就是 types.ts L39-L41 注释所说的 "`tool_execution_end` is emitted in tool completion order ... while tool-result message artifacts are emitted later in assistant source order"。
+
+### 4.4 executePreparedToolCall：流式部分更新
+
+`packages/agent/src/agent-loop.ts`（课程快照 L670-L711）：
+
+```typescript
+async function executePreparedToolCall(prepared, signal, emit): Promise<ExecutedToolCallOutcome> {
+	const updateEvents: Promise<void>[] = [];
+	let acceptingUpdates = true;
+	try {
+		const result = await prepared.tool.execute(
+			prepared.toolCall.id,
+			prepared.args as never,
+			signal,
+			(partialResult) => {              // onUpdate 回调
+				if (!acceptingUpdates) return; // settle 后的调用直接忽略
+				updateEvents.push(Promise.resolve(emit({ type: "tool_execution_update", ... })));
+			},
+		);
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);      // 等待所有 in-flight update 事件
+		return { result, isError: false };
+	} catch (error) {
+		acceptingUpdates = false;
+		await Promise.all(updateEvents);
+		return { result: createErrorToolResult(String(error)), isError: true };
+	} finally {
+		acceptingUpdates = false;
+	}
+}
+```
+
+**教学要点**：
+1. `acceptingUpdates` 标志 + finally 三重置——工具 promise settle 后 onUpdate 回调静默忽略（types.ts L380-L383 注释的兑现），防止晚到的部分结果事件乱序混入。
+2. **工具 throw → isError 结果**（catch 分支）——第 1 课"Throw on failure"契约在此落地。
+3. update 事件 fire-and-forget 收集、settle 后 `Promise.all`——不阻塞工具执行主线。
+
+### 4.5 finalizeExecutedToolCall：字段级覆盖
+
+`packages/agent/src/agent-loop.ts`（课程快照 L713-L758）：
+
+```typescript
+if (afterResult) {
+	result = {
+		...result,
+		content: afterResult.content ?? result.content,    // 提供才覆盖
+		details: afterResult.details ?? result.details,
+		usage: afterResult.usage ?? result.usage,
+		terminate: afterResult.terminate ?? result.terminate,
+	};
+	isError = afterResult.isError ?? isError;
+}
+```
+
+`??` 链实现"省略字段保持原值"——与 types.ts L74-L83 注释的合并语义严格一致，**无深合并**。
+
+---
+
+## 第 5 课 内置工具四件套
+
+**目录**：`packages/agent/src/harness/tools`
+
+### 5.1 bash 工具：节流流式输出
+
+`packages/agent/src/harness/tools/bash.ts`（161 行）
+
+Schema（L11-L14）：
+
+```typescript
+const bashSchema = Type.Object({
+	command: Type.String({ description: "Bash command to execute" }),
+	timeout: Type.Optional(Type.Number({ description: "Timeout in seconds (optional, no default timeout)" })),
+});
+```
+
+**流式更新节流**（L9、L69-L105）：
+
+```typescript
+const BASH_UPDATE_THROTTLE_MS = 100;
+
+const emitOutputUpdate = (): void => {
+	if (!onUpdate || !updateDirty || !getLatestProgress) return;
+	updateDirty = false;
+	lastUpdateAt = Date.now();
+	const progress = getLatestProgress();
+	onUpdate({
+		content: [{ type: "text", text: progress.output }],
+		details: { truncation: ..., fullOutputPath: ... },
+	});
+};
+
+const scheduleOutputUpdate = (): void => {
+	if (!onUpdate) return;
+	updateDirty = true;
+	const delay = BASH_UPDATE_THROTTLE_MS - (Date.now() - lastUpdateAt);
+	if (delay <= 0) { clearUpdateTimer(); emitOutputUpdate(); return; }
+	updateTimer ??= setTimeout(() => { updateTimer = undefined; emitOutputUpdate(); }, delay);
+};
+```
+
+每个输出 chunk 到来时只调 `scheduleOutputUpdate()`（标脏 + 定时），实际 emit 最多 100ms 一次——**长输出命令不会淹没事件流**。
+
+**截断与全文落盘**（L128-L142）：输出超过上限（DEFAULT_MAX_LINES 行 / DEFAULT_MAX_BYTES 字节）时截断显示，全文写入临时文件，并在文本尾部追加提示：
+
+```
+[Showing lines 81-580 of 1200. Full output: /tmp/xxx]
+```
+
+**错误统一 throw**（L144-L154）：`cancelled` → throw "Command aborted"；timeout → throw 带原因；非零退出码 → throw `Command exited with code N`（错误消息包含已有输出，模型能看到部分输出+失败原因）。
+
+**教学要点**：`options.prepare`（L30-L39、L68）是执行前钩子——宿主可以改写 command（如加 commandPrefix）、cwd、env。Gondolin 微 VM 沙箱就是在这里把命令路由进 VM 的。
+
+### 5.2 read 工具：文本与图片双模
+
+`packages/agent/src/harness/tools/read.ts`（144 行）
+
+关键分支：先嗅探 magic bytes（`detectSupportedImageMimeType`，L56），图片走 ImageContent 分支（可注入 imageProcessor 缩放，L58-L95），文本走行切片分支。
+
+**文本续读设计**（L97-L141）：
+
+```typescript
+const allLines = textContent.split("\n");
+const startLine = offset ? Math.max(0, offset - 1) : 0;
+// ...
+const truncation = truncateHead(selectedContent);   // 保留尾部（最新内容）
+if (truncation.truncated) {
+	const endLineDisplay = startLineDisplay + truncation.outputLines - 1;
+	const nextOffset = endLineDisplay + 1;
+	outputText += `\n\n[Showing lines ${startLineDisplay}-${endLineDisplay} of ${totalFileLines}. Use offset=${nextOffset} to continue.]`;
+}
+```
+
+**教学要点**：
+1. 截断策略是 `truncateHead`——**保留尾部**。文件头部是 import/声明，尾部是近期修改，对代码任务尾部信息密度更高。
+2. 截断提示语直接告诉模型**下一跳参数**（`Use offset=N to continue`）——把续读协议写进模型可见文本，模型无需猜。
+3. 超长单行（`firstLineExceedsLimit`，L119-L122）时给出 bash 替代命令：`sed -n 'Np' file | head -c LIMIT`——工具间的降级路径。
+
+### 5.3 edit 工具：精确替换 + 兼容垫片
+
+`packages/agent/src/harness/tools/edit.ts`（127 行）
