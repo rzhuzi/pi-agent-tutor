@@ -1,0 +1,195 @@
+```typescript
+export default function (pi: ExtensionAPI) {
+  // 拦截 bash 危险命令
+  pi.on("tool_call", async (event, ctx) => {
+    if (event.toolName === "bash" && event.input.command?.includes("rm -rf")) {
+      const ok = await ctx.ui.confirm("危险操作", `允许执行？\n${event.input.command}`);
+      if (!ok) return { block: true, reason: "用户拒绝" };
+    }
+  });
+
+  // 注册工具
+  pi.registerTool({
+    name: "greet",
+    description: "向某人问好",
+    parameters: Type.Object({ name: Type.String() }),
+    async execute(toolCallId, params) {
+      return { content: [{ type: "text", text: `你好，${params.name}!` }] };
+    },
+  });
+
+  // 注册命令 / 快捷键 / provider
+  pi.registerCommand("hello", { handler: async (args, ctx) => ctx.ui.notify(`Hello!`, "info") });
+  pi.registerShortcut("ctrl+g", { handler: async (ctx) => { /* ... */ } });
+  pi.registerProvider("my-proxy", { baseUrl: "...", apiKey: "...", models: [...], api: "openai-completions" });
+}
+```
+
+生命周期约定（extensions.md）：async factory 完成后才开始 `session_start`；长生命周期资源在 `session_start` 起、`session_shutdown` 关（factory 可能在不启 session 的调用里跑）。
+
+---
+
+## 第 10 课 Skills 与 System Prompt
+
+### 10.1 渐进式披露的实现
+
+`packages/agent/src/harness/system-prompt.ts`（34 行，全文核心）：
+
+```typescript
+export function formatSkillsForSystemPrompt(skills: Skill[]): string {
+	const visibleSkills = skills.filter((skill) => !skill.disableModelInvocation);
+	if (visibleSkills.length === 0) return "";
+
+	const lines = [
+		"The following skills provide specialized instructions for specific tasks.",
+		"Read the full skill file when the task matches its description.",
+		"When a skill file references a relative path, resolve it against the skill directory (parent of SKILL.md / dirname of the path) and use that absolute path in tool commands.",
+		"",
+		"<available_skills>",
+	];
+
+	for (const skill of visibleSkills) {
+		lines.push("  <skill>");
+		lines.push(`    <name>${escapeXml(skill.name)}</name>`);
+		lines.push(`    <description>${escapeXml(skill.description)}</description>`);
+		lines.push(`    <location>${escapeXml(skill.filePath)}</location>`);
+		lines.push("  </skill>");
+	}
+
+	lines.push("</available_skills>");
+	return lines.join("\n");
+}
+```
+
+**教学要点**：
+1. system prompt 只注入 **name + description + location** 三元组——模型匹配到任务后用现成的 `read` 工具加载 SKILL.md 全文。100 个 skill 也只占几百 token 索引。
+2. 第三行指令显式教模型**相对路径解析规则**（相对 skill 目录）——skill 里引用 `./search.js` 时模型能算出绝对路径去 bash 执行。
+3. `disableModelInvocation` 的 skill 不进列表（仅供人类 `/skill:name` 调用）。
+
+### 10.2 skill 发现与校验
+
+`packages/coding-agent/src/core/skills.ts`：
+
+- 规范校验（L92-L112）：name ≤64 字符、`/^[a-z0-9-]+$/`、不以连字符开头/结尾、无连续连字符；description ≤1024 字符（Agent Skills 规范）。
+- 发现路径：`~/.pi/agent/skills/`、`~/.agents/skills/`（全局）、`.pi/skills/`、`.agents/skills/`（项目，trust 后）、`package.json` 的 `pi.skills`、settings `skills` 数组、`--skill` flag。
+- gitignore 感知（L16、L24-L65）：`addIgnoreRules` 读取 `.gitignore/.ignore/.fdignore` 并**按目录前缀改写模式**（`prefixIgnorePattern`）——扫描项目时尊重仓库的忽略规则，不把 node_modules 里的伪 skill 扫出来。
+
+---
+
+## 第 11 课 AgentSession：模式共享骨架
+
+**文件**：`packages/coding-agent/src/core/agent-session.ts`（2200+ 行，coding-agent 最大文件）
+
+头注释（L1-L14）定义其定位：
+
+```
+AgentSession - Core abstraction for agent lifecycle and session management.
+
+This class is shared between all run modes (interactive, print, rpc).
+It encapsulates:
+- Agent state access
+- Event subscription with automatic session persistence
+- Model and thinking level management
+- Compaction (manual and auto)
+- Bash execution
+- Session switching and branching
+
+Modes use this class and add their own I/O layer on top.
+```
+
+**架构角色**：
+
+```
+interactive TUI ─┐
+print mode ──────┤
+JSON mode ───────┼──> AgentSession ──> Agent（agent-core）──> agentLoop ──> StreamFn（pi-ai）
+RPC mode ────────┤        │
+SDK 嵌入 ────────┘        └──> SessionManager（JSONL 持久化）
+                          └──> ExtensionRunner（扩展事件）
+                          └──> ModelRegistry（模型管理）
+                          └──> SettingsManager（设置/压缩阈值）
+```
+
+AgentSession 是**所有模式的共享中间层**——把"agent 生命周期 + 持久化 + 压缩 + 扩展接线"做一次，模式只加 I/O。它订阅 Agent 事件并把消息自动写入 session（"Event subscription with automatic session persistence"），第 7 课的 `_checkCompaction`/`_runAutoCompaction` 也在这里。
+
+**教学要点**：对比 dsh 用 Cordis 插件组合出 web/headless 两种 profile，pi 用"共享类 + 模式薄壳"达到同样效果——不需要框架，一个抽象层就够。
+
+---
+
+## 第 12 课 durable harness：规格 vs 占位实现
+
+### 12.1 AgentHarness 类的现状
+
+`packages/agent/src/harness/agent-harness.ts`：类型完整（RunOutcome / CompactionOutcome / NavigationOutcome、HookName 枚举、AgentHarnessOptions），`constructor`/`create` 已实现，但 **所有 mutating 方法（prompt/compact/navigateTree/resume…）抛 `HarnessNotImplemented`**。
+
+### 12.2 规格的三个核心（docs/harness.md）
+
+**① 三 stores 一不变量**：
+
+```
+entries        会话树 — write-once，append-only
+registers      可变状态 — namespaced typed cells，overwrite/delete
+usage ledger   成本历史 — append-only rows
+```
+
+**② durable 程序计数器**：每步之后 overwrite register `op.state/{operationId}`，存**完整**当前 operation state（total state，不依赖前态）。恢复时不 replay journal、不推断——读 register、switch on it。
+
+**③ effect sandwich**：
+
+```
+TX: "about to do X; output will use ids R and U"     ← intent（预登记输出 id）
+    do X                                              ← 不确定窗口（provider 请求/工具执行）
+TX: output + usage + next state                       ← settlement（回填）
+```
+
+崩溃在 effect 中间 → 读 op.state 见 `effect_pending` + replay policy：`replay: "never"`（删文件等）注入合成 "interrupted" 结果、不重跑；`replay: "safe"`（读/查询）用持久化参数重跑。
+
+### 12.3 存储层已就位、执行层未接线
+
+第 6 课已展示：`ToolStartedRecord.replay` 字段、`operation_started/finished` record、seq 严格连续的原子性——**存储词汇表已经为 effect sandwich 备好**。缺的是 AgentHarness 执行层把这些 record 真正写起来、崩溃恢复逻辑真正跑起来。
+
+**教学要点**：这是"规格先行、渐进实现"的工程样本——JSONL 后端（已生产）与 harness 规格（在制品）共享同一套 mutation 模型，未来接线不需要迁移存储格式。
+
+---
+
+## 第 13 课 总复习：设计模式清单 + 练习
+
+### 13.1 本课程提取的设计模式
+
+| 模式 | 出处 | 一句话 |
+|---|---|---|
+| **错误即数据** | StreamFn 契约、工具 throw、handleRunFailure | 失败编码进合法事件流，循环层零 try/catch |
+| **双层消息管道** | transformContext → convertToLlm | transcript 语义与 LLM 语义分离，自定义消息类型靠 declaration merging |
+| **单飞行 + 双队列** | Agent.activeRun / steering / followUp | 并发 prompt 拒绝，插话走队列，drain 点注入 |
+| **批次 terminate AND 语义** | shouldTerminateToolBatch | 早停是全批共识，单个工具说了不算 |
+| **事件顺序与消息顺序解耦** | executeToolCallsParallel | end 事件按完成序、消息按源序，两头都对 |
+| **write-ahead 内存提交** | appendEntry 先落盘再 applyMutation | 崩溃后重放幂等重建 |
+| **单写队列** | JsonlSessionStorage.enqueue | promise 链串行化所有写，文件永不交错 |
+| **torn-tail 判定** | load() 最后一行+语法错 | 追加写崩溃只损坏末行，中间损坏即报错 |
+| **原子发布** | publishFileAtomically | 临时文件 + rename，崩溃只留 .tmp |
+| **真值锚点+增量估算** | estimateContextTokens | provider usage 为锚，其后启发式 |
+| **虚拟切点回退** | prepareCompaction 的 retainedTail 展开 | 上一轮保留尾部参与本轮切分 |
+| **请求隔离** | 摘要的 cacheRetention:none + 新 sessionId | 一次性请求不污染可复用缓存 |
+| **函数注入反转** | Agent 只认 StreamFn 签名 | agent 与 pi-ai 解耦，可离线测试 |
+| **虚拟模块 + 双 scope 别名** | extension loader | 单文件二进制内给扩展提供 import，旧名兼容 |
+| **保留键位优先** | runner 的 reserved keybindings | 扩展不能劫持核心快捷键 |
+
+### 13.2 练习
+
+**练习 1（事件流）**：不运行代码，手写以下场景的完整事件序列：prompt("hi") → 模型回复一次工具调用 bash("ls") → 工具成功 → 模型纯文本回复。标注每个事件的关键字段值。
+
+**练习 2（ terminate 语义）**：一个 assistant 消息含三个工具调用，结果分别是 A(terminate:true)、B(terminate:true)、C(terminate:false)。问：内层循环是否继续？依据是哪行代码？
+
+**练习 3（seq 连续性）**：一个 JSONL 文件的 mutation seq 为 1,2,3,5。load 时发生什么？如果是 1,2,3,4 且第 4 行 JSON 语法损坏呢？两种情况行为为何不同？
+
+**练习 4（切点））**：keepRecentTokens=20000，从尾部累加到 18000 时遇到全是 toolResult 的 5000 token 段。描述 findCutPoint 的行为与最终切点位置。
+
+**练习 5（实现题）**：给 Agent 加一个 `beforeProviderRequest` 钩子（在 streamFn 调用前触发、可修改即将发送的 llmContext）。指出需要改动的最小文件集合与插入点（提示：streamAssistantResponse 内、第 5 步之前）。
+
+**练习 6（对比题）**：用第 6 课的知识解释：为什么 pi 当前版本崩溃恢复无法回答"那个删文件的 bash 到底跑没跑"？harness.md 的哪三个机制合起来解决这个问题？
+
+### 13.3 延伸阅读
+
+- `packages/agent/docs/harness.md`——durable runtime 完整规格（224KB，9 part + 3 appendix）
+- `packages/agent/README.md`——agent 包 API 文档，钩子语义的权威描述
+- `packages/coding-agent/docs/extensions.md`——ExtensionAPI 全量事件/方法参考
