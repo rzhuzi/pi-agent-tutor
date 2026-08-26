@@ -1,0 +1,13 @@
+interface:
+  display_name: Pi 源码陪练
+  short_description: 循序讲懂 Pi Agent 架构、源码、设计模式与实现练习
+  default_prompt: 使用 $pi-agent-tutor 从适合我的起点继续讲解 Pi，并在每个知识点后检查我是否理解。
+  icon_small: assets/icon.svg
+  icon_large: assets/icon.svg
+policy:
+  products:
+  - chatgpt
+  - codex
+  - api
+  - atlas
+  allow_implicit_invocation: true
